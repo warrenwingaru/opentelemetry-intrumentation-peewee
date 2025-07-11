@@ -1,10 +1,11 @@
+from timeit import default_timer
 from typing import Collection
 from functools import wraps
 
 import peewee
 from peewee import SENTINEL
 
-from opentelemetry import trace
+from opentelemetry import trace, metrics
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.semconv.trace import SpanAttributes
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
@@ -17,6 +18,13 @@ def _get_tracer(trace_provider=None):
         __name__,
         __version__,
         tracer_provider=trace_provider
+    )
+
+def _get_meter(meter_provider=None):
+    return metrics.get_meter(
+        __name__,
+        __version__,
+        meter_provider=meter_provider
     )
 
 def _get_attributes_from_url(url):
@@ -56,13 +64,13 @@ def _normalize_vendor(vendor):
 
     raise ValueError
 
-def _wrap_execute_sql(trace_provider=None):
-    tracer = _get_tracer(trace_provider)
+def _wrap_execute_sql(tracer,duration_histogram):
 
     original_execute = peewee.Database.execute_sql
 
     @wraps(original_execute)
     def execute_sql(self, sql, params=None, commit=SENTINEL):
+        start = default_timer()
         database = self.database
         vendor = _normalize_vendor(self.__class__.__name__)
         attrs, found = _get_attributes_from_connect_params(self.connect_params)
@@ -73,6 +81,13 @@ def _wrap_execute_sql(trace_provider=None):
             _get_operation_name(vendor, database, sql),
             kind=SpanKind.CLIENT
         )
+        duration_attrs = {
+            "db.system.name": vendor,
+            "db.query.text": sql
+        }
+        if SpanAttributes.NET_HOST_NAME in attrs:
+            duration_attrs["db.server.address"] = attrs[SpanAttributes.NET_HOST_NAME]
+
         with trace.use_span(span, end_on_exit=True):
             if span.is_recording():
                 span.set_attribute(SpanAttributes.DB_STATEMENT, sql)
@@ -87,7 +102,7 @@ def _wrap_execute_sql(trace_provider=None):
                             StatusCode.OK
                         )
                     )
-                return original_execute(self, sql, params, commit)
+                result = original_execute(self, sql, params, commit)
             except Exception as exc:
                 span.record_exception(exc)
                 span.set_status(
@@ -97,21 +112,26 @@ def _wrap_execute_sql(trace_provider=None):
                     )
                 )
                 raise
+            duration_s = default_timer() - start
+            duration_histogram.record(max(round(duration_s * 1000), 0), duration_attrs)
+            return result
+        return None
 
     return execute_sql
 
-def _wrap_connect(trace_provider=None):
-    tracer  = _get_tracer(trace_provider)
+def _wrap_connect(tracer, active_connections):
 
     original_connect = peewee.Database.connect
 
     @wraps(original_connect)
     def connect(self, reuse_if_open=False):
         with tracer.start_as_current_span(
-            "connect", kind=SpanKind.CLIENT
+                "connect", kind=SpanKind.CLIENT
         ) as span:
             try:
-                return original_connect(self, reuse_if_open)
+                result = original_connect(self, reuse_if_open)
+                active_connections.add(1)
+                return result
             except Exception as exc:
                 if span.is_recording():
                     span.record_exception(exc)
@@ -122,11 +142,20 @@ def _wrap_connect(trace_provider=None):
                         )
                     )
                 raise
-
-
-
+        return None
 
     return connect
+
+def _wrap_close(active_connections):
+
+    original_close = peewee.Database.close
+
+    @wraps(original_close)
+    def close(self):
+        result =  original_close(self)
+        active_connections.add(-1)
+        return result
+    return close
 
 
 class PeeweeInstrumentor(BaseInstrumentor):
@@ -134,12 +163,32 @@ class PeeweeInstrumentor(BaseInstrumentor):
         return _instruments
 
     def _instrument(self, **kwargs):
-        self.original_mysql_database = peewee.MySQLDatabase
+        self.original_connect = peewee.Database.connect
+        self.original_execute = peewee.Database.execute_sql
+        self.original_close = peewee.Database.close
         trace_provider = kwargs.get('trace_provider', None)
+        meter_provider = kwargs.get('meter_provider', None)
 
-        peewee.Database.connect = _wrap_connect(trace_provider)
-        peewee.Database.execute_sql = _wrap_execute_sql(trace_provider)
+        meter = _get_meter(meter_provider)
+
+        active_connections = meter.create_up_down_counter(
+            name="db.client.connection.count",
+            unit="{connection}",
+            description="The number of active connections",
+        )
+        duration_histogram = meter.create_histogram(
+            name="db.client.operation.duration",
+            unit="ms",
+            description="The duration of the operation",
+        )
+        tracer = _get_tracer(trace_provider)
+
+        peewee.Database.connect = _wrap_connect(tracer, active_connections)
+        peewee.Database.execute_sql = _wrap_execute_sql(tracer, duration_histogram)
+        peewee.Database.close = _wrap_close(active_connections)
 
 
     def _uninstrument(self, **kwargs):
-        pass
+        peewee.Database.connect = self.original_connect
+        peewee.Database.execute_sql = self.original_execute
+        peewee.Database.close = self.original_close
