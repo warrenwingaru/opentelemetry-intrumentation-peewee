@@ -8,17 +8,22 @@ from peewee import SENTINEL
 from opentelemetry import trace, metrics
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.semconv.trace import SpanAttributes
+from opentelemetry.instrumentation.utils import (
+    _add_sql_comment,
+    _get_opentelemetry_values
+)
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.peewee.package import _instruments
 from opentelemetry.instrumentation.peewee.version import __version__
 
 
-def _get_tracer(trace_provider=None):
+def _get_tracer(tracer_provider=None):
     return trace.get_tracer(
         __name__,
         __version__,
-        tracer_provider=trace_provider
+        tracer_provider=tracer_provider
     )
+
 
 def _get_meter(meter_provider=None):
     return metrics.get_meter(
@@ -27,19 +32,22 @@ def _get_meter(meter_provider=None):
         meter_provider=meter_provider
     )
 
+
 def _get_attributes_from_url(url):
     pass
+
 
 def _get_attributes_from_connect_params(params):
     attrs = {}
     if 'host' in params:
-        attrs[SpanAttributes.NET_HOST_NAME] =  params.get('host')
+        attrs[SpanAttributes.NET_HOST_NAME] = params.get('host')
     if 'user' in params:
         attrs[SpanAttributes.DB_USER] = params.get('user')
 
     attrs[SpanAttributes.NET_HOST_PORT] = params.get('port', 3306)
 
     return attrs, bool('host' in params)
+
 
 def _get_operation_name(vendor, db_name, sql):
     parts = []
@@ -51,8 +59,8 @@ def _get_operation_name(vendor, db_name, sql):
         return vendor
     return " ".join(parts)
 
-def _normalize_vendor(vendor):
 
+def _normalize_vendor(vendor):
     if 'sqlite' in vendor.lower():
         return 'sqlite'
 
@@ -64,8 +72,13 @@ def _normalize_vendor(vendor):
 
     raise ValueError
 
-def _wrap_execute_sql(tracer,duration_histogram):
 
+def _wrap_execute_sql(
+        duration_histogram,
+        tracer=None,
+        enable_sqlcommenter=False,
+        commenter_options=None
+):
     original_execute = peewee.Database.execute_sql
 
     @wraps(original_execute)
@@ -93,7 +106,25 @@ def _wrap_execute_sql(tracer,duration_histogram):
                 span.set_attribute(SpanAttributes.DB_STATEMENT, sql)
                 span.set_attribute(SpanAttributes.DB_SYSTEM, vendor)
                 for key, value in attrs.items():
-                    span.set_attribute(key,value)
+                    span.set_attribute(key, value)
+            if enable_sqlcommenter:
+                commenter_data = dict(
+                    db_driver=self.__class__.__name__,
+                    db_framework=f'peewee:{__version__}'
+                )
+
+                if commenter_options.get('opentelemetry_values', True):
+                    commenter_data.update(**_get_opentelemetry_values())
+
+                # Filter down to just the requested attributes
+                commenter_data = {
+                    k: v
+                    for k, v in commenter_data.items()
+                    if commenter_options.get(k, True)
+                }
+                print('before add comment sql {}'.format(sql))
+                sql = _add_sql_comment(sql, **commenter_data)
+                print('after add comment sql {}'.format(sql))
 
             try:
                 if span.is_recording():
@@ -120,8 +151,8 @@ def _wrap_execute_sql(tracer,duration_histogram):
 
     return execute_sql
 
-def _wrap_connect(tracer, active_connections):
 
+def _wrap_connect(tracer, active_connections):
     original_connect = peewee.Database.connect
 
     @wraps(original_connect)
@@ -147,15 +178,16 @@ def _wrap_connect(tracer, active_connections):
 
     return connect
 
-def _wrap_close(active_connections):
 
+def _wrap_close(active_connections):
     original_close = peewee.Database.close
 
     @wraps(original_close)
     def close(self):
-        result =  original_close(self)
+        result = original_close(self)
         active_connections.add(-1)
         return result
+
     return close
 
 
@@ -167,8 +199,8 @@ class PeeweeInstrumentor(BaseInstrumentor):
         self.original_connect = peewee.Database.connect
         self.original_execute = peewee.Database.execute_sql
         self.original_close = peewee.Database.close
-        trace_provider = kwargs.get('trace_provider', None)
-        meter_provider = kwargs.get('meter_provider', None)
+        tracer_provider = kwargs.get('tracer_provider')
+        meter_provider = kwargs.get('meter_provider')
 
         meter = _get_meter(meter_provider)
 
@@ -182,12 +214,16 @@ class PeeweeInstrumentor(BaseInstrumentor):
             unit="ms",
             description="The duration of the operation",
         )
-        tracer = _get_tracer(trace_provider)
+        tracer = _get_tracer(tracer_provider)
+
+        enable_commenter = kwargs.get('enable_commenter', False)
+        commenter_options = kwargs.get('commenter_options', {})
 
         peewee.Database.connect = _wrap_connect(tracer, active_connections)
-        peewee.Database.execute_sql = _wrap_execute_sql(tracer, duration_histogram)
+        peewee.Database.execute_sql = _wrap_execute_sql(tracer=tracer, duration_histogram=duration_histogram,
+                                                        enable_sqlcommenter=enable_commenter,
+                                                        commenter_options=commenter_options)
         peewee.Database.close = _wrap_close(active_connections)
-
 
     def _uninstrument(self, **kwargs):
         peewee.Database.connect = self.original_connect
