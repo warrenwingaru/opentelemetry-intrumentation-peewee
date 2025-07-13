@@ -112,8 +112,9 @@ def _wrap_execute_sql(tracer,duration_histogram):
                     )
                 )
                 raise
-            duration_s = default_timer() - start
-            duration_histogram.record(max(round(duration_s * 1000), 0), duration_attrs)
+            finally:
+                duration_s = default_timer() - start
+                duration_histogram.record(max(round(duration_s * 1000), 0), duration_attrs)
             return result
         return None
 
