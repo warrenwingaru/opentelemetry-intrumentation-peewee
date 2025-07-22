@@ -168,13 +168,13 @@ def _wrap_connect(tracer, active_connections):
                 _add_used_to_connection_usage(self, active_connections, 1)
                 return result
             except Exception as exc:
-                    span.record_exception(exc)
-                    span.set_status(
-                        Status(
-                            StatusCode.ERROR,
-                            str(exc)
-                        )
+                span.record_exception(exc)
+                span.set_status(
+                    Status(
+                        StatusCode.ERROR,
+                        str(exc)
                     )
+                )
                 raise
         return None
 
