@@ -8,10 +8,8 @@ from peewee import SENTINEL
 from opentelemetry import trace, metrics
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.semconv.trace import SpanAttributes
-from opentelemetry.instrumentation.utils import (
-    _add_sql_comment,
-    _get_opentelemetry_values
-)
+from opentelemetry.instrumentation.sqlcommenter_utils import _add_sql_comment
+from opentelemetry.instrumentation.utils import _get_opentelemetry_values
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.peewee.package import _instruments
 from opentelemetry.instrumentation.peewee.version import __version__
@@ -21,7 +19,8 @@ def _get_tracer(tracer_provider=None):
     return trace.get_tracer(
         __name__,
         __version__,
-        tracer_provider=tracer_provider
+        tracer_provider=tracer_provider,
+        schema_url="https://opentelemetry.io/schemas/1.11.0"
     )
 
 
@@ -29,7 +28,8 @@ def _get_meter(meter_provider=None):
     return metrics.get_meter(
         __name__,
         __version__,
-        meter_provider=meter_provider
+        meter_provider=meter_provider,
+        schema_url="https://opentelemetry.io/schemas/1.11.0"
     )
 
 
@@ -122,10 +122,7 @@ def _wrap_execute_sql(
                     for k, v in commenter_data.items()
                     if commenter_options.get(k, True)
                 }
-                print('before add comment sql {}'.format(sql))
                 sql = _add_sql_comment(sql, **commenter_data)
-                print('after add comment sql {}'.format(sql))
-
             try:
                 if span.is_recording():
                     span.set_status(
@@ -160,12 +157,17 @@ def _wrap_connect(tracer, active_connections):
         with tracer.start_as_current_span(
                 "connect", kind=SpanKind.CLIENT
         ) as span:
+            if span.is_recording():
+                attrs, found = _get_attributes_from_connect_params(self.connect_params)
+                span.set_attributes(attrs)
+                span.set_attribute(
+                    SpanAttributes.DB_SYSTEM, _normalize_vendor(self.__class__.__name__)
+                )
             try:
                 result = original_connect(self, reuse_if_open)
-                active_connections.add(1)
+                _add_used_to_connection_usage(self, active_connections, 1)
                 return result
             except Exception as exc:
-                if span.is_recording():
                     span.record_exception(exc)
                     span.set_status(
                         Status(
@@ -185,12 +187,58 @@ def _wrap_close(active_connections):
     @wraps(original_close)
     def close(self):
         result = original_close(self)
-        active_connections.add(-1)
+        _add_used_to_connection_usage(self, active_connections, -1)
         return result
 
     return close
 
+# Can't use this as peewee can't hook into checkin/checkout
+def _add_idle_to_connection_usage(database,active_connections, value):
+    active_connections.add(
+        value,
+        attributes={
+            **_get_attributes_from_database(database),
+            "state": "idle"
+        }
+    )
 
+def _add_used_to_connection_usage(database, active_connections, value):
+    active_connections.add(
+        value,
+        attributes={
+            **_get_attributes_from_database(database),
+            "state": "used"
+        }
+    )
+
+def _get_connection_string(database):
+    if hasattr(database, 'connect_params'):
+        params = database.connect_params
+        host = params.get('host')
+        port = params.get('port', 3306)
+        name = database.database
+
+        if isinstance(database, peewee.SqliteDatabase):
+            drivername = 'sqlite'
+        elif isinstance(database, peewee.MySQLDatabase):
+            drivername = 'mysql'
+        elif isinstance(database, peewee.PostgresqlDatabase):
+            drivername = 'postgresql'
+        else:
+            drivername = ''
+
+        return f'{drivername}://{host}:{port}/{name}'
+    if isinstance(database, peewee.SqliteDatabase):
+        return f'sqlite://{database.database}'
+
+    return ''
+
+def _get_attributes_from_database(database):
+    attrs = {}
+
+    attrs["pool.name"] = _get_connection_string(database)
+
+    return attrs
 class PeeweeInstrumentor(BaseInstrumentor):
     def instrumentation_dependencies(self) -> Collection[str]:
         return _instruments
@@ -206,7 +254,7 @@ class PeeweeInstrumentor(BaseInstrumentor):
 
         active_connections = meter.create_up_down_counter(
             name="db.client.connection.count",
-            unit="{connection}",
+            unit="connection",
             description="The number of active connections",
         )
         duration_histogram = meter.create_histogram(
