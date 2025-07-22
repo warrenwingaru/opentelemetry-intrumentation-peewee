@@ -16,7 +16,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
@@ -24,9 +23,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-    "opentelemetry-instrumentation == 0.43b0",
+    "opentelemetry-instrumentation == 0.54b1",
     "opentelemetry-api ~= 1.12",
-    "opentelemetry-semantic-conventions == 0.43b0",
+    "opentelemetry-semantic-conventions == 0.54b1",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +34,7 @@ instruments = [
 ]
 test = [
     "opentelemetry-sdk ~= 1.12",
-    "opentelemetry-test-utils == 0.43b0",
+    "opentelemetry-test-utils == 0.54b1",
     "pytest",
     "opentelemetry-instrumentation-peewee[instruments]"
 ]
